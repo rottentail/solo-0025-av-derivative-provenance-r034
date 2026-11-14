@@ -18,7 +18,6 @@ from .models import (
     Rendition,
 )
 from .media import inspect_media
-from .renditions.executor import execution_window
 from .renditions import (
     compile_plan,
     execute_plan,
@@ -71,7 +70,6 @@ class MediaProvenanceApplication:
         descriptor = inspect_media(data)
         digest = sha256_hex(data)
         content_key = self.content_files.key_for_digest(digest)
-        existed = self.content_files.exists(content_key)
         self.content_files.write(data, digest)
         asset = MediaAsset(
             id=new_identifier("asset"),
@@ -86,8 +84,13 @@ class MediaProvenanceApplication:
         try:
             persisted = self.repository.create_asset(asset)
         except Exception:
-            if not existed:
-                self.content_files.remove(content_key)
+            # The blob is content-addressed and shared. Only drop it when no
+            # asset (including one committed by a concurrent request) refers to
+            # it, otherwise this failure path could delete delivered media.
+            self.content_files.remove_unreferenced(
+                content_key,
+                lambda: self.repository.content_key_is_referenced(content_key),
+            )
             raise
         return persisted.to_public_dict()
 
@@ -154,55 +157,57 @@ class MediaProvenanceApplication:
         self.repository.transition_rendition(rendition.id, "running")
 
         try:
-            source_keys = [primary.content_key]
-            if secondary is not None:
-                source_keys.append(secondary.content_key)
-            with self.content_files.source_lease(source_keys):
-                primary_bytes = self._asset_bytes(primary)
-                secondary_bytes = self._asset_bytes(secondary) if secondary else None
-                outcome = execute_plan(
-                    primary_bytes,
-                    plan.operations,
-                    secondary_bytes,
-                )
-                output_digest = sha256_hex(outcome.data)
-                output_key = self.content_files.key_for_digest(output_digest)
-                output_existed = self.content_files.exists(output_key)
+            # Read immutable source bytes. Each blob read takes only that key's
+            # reader lease, so requests sharing sources (in either role) run
+            # concurrently instead of deadlocking.
+            primary_bytes = self._asset_bytes(primary)
+            secondary_bytes = self._asset_bytes(secondary) if secondary else None
+            # Rendering is a pure function of the bytes above and runs outside
+            # every shared lock so independent work actually overlaps.
+            outcome = execute_plan(
+                primary_bytes,
+                plan.operations,
+                secondary_bytes,
+            )
+            output_digest = sha256_hex(outcome.data)
+            output_key = self.content_files.key_for_digest(output_digest)
+            output_asset = MediaAsset(
+                id=new_identifier("asset"),
+                filename=output_name,
+                kind=outcome.descriptor.kind,
+                sha256=output_digest,
+                size_bytes=len(outcome.data),
+                content_key=output_key,
+                descriptor=outcome.descriptor,
+                created_at=utc_now(),
+            )
+            edge = ProvenanceEdge(
+                id=new_identifier("edge"),
+                rendition_id=rendition.id,
+                parent_asset_ids=[
+                    item
+                    for item in (primary.id, secondary.id if secondary else None)
+                    if item is not None
+                ],
+                operation_types=list(outcome.operation_types),
+                plan_digest=plan.digest,
+                output_asset_id=output_asset.id,
+                created_at=utc_now(),
+            )
+            # Publish and commit under one exclusive lease for this digest. The
+            # blob is content-addressed and shared, so a failed commit leaves at
+            # most an unreferenced blob behind, never a completed edge pointing
+            # at missing bytes. Holding the lease across the metadata commit
+            # also keeps a concurrent reference-checked cleanup from removing
+            # bytes that are about to become a delivered output.
+            with self.content_files.write_lease(output_key):
                 self.content_files.write(outcome.data, output_digest)
-                output_asset = MediaAsset(
-                    id=new_identifier("asset"),
-                    filename=output_name,
-                    kind=outcome.descriptor.kind,
-                    sha256=output_digest,
-                    size_bytes=len(outcome.data),
-                    content_key=output_key,
-                    descriptor=outcome.descriptor,
-                    created_at=utc_now(),
+                completed = self.repository.complete_rendition(
+                    rendition.id,
+                    output_asset,
+                    edge,
                 )
-                edge = ProvenanceEdge(
-                    id=new_identifier("edge"),
-                    rendition_id=rendition.id,
-                    parent_asset_ids=[
-                        item
-                        for item in (primary.id, secondary.id if secondary else None)
-                        if item is not None
-                    ],
-                    operation_types=list(outcome.operation_types),
-                    plan_digest=plan.digest,
-                    output_asset_id=output_asset.id,
-                    created_at=utc_now(),
-                )
-                try:
-                    completed = self.repository.complete_rendition(
-                        rendition.id,
-                        output_asset,
-                        edge,
-                    )
-                except Exception:
-                    if not output_existed:
-                        self.content_files.remove(output_key)
-                    raise
-                return self._rendition_view(completed)
+            return self._rendition_view(completed)
         except ApplicationError as exc:
             current = self.repository.get_rendition(rendition.id)
             if current.status == "running":
@@ -225,6 +230,24 @@ class MediaProvenanceApplication:
                 message="The rendition failed before completion.",
                 status=409,
             ) from exc
+        finally:
+            # An accepted rendition must always leave "running". This covers
+            # BaseException paths and a failure while recording the failure
+            # itself, so no later request is held hostage by a stuck record.
+            self._settle_rendition_if_running(rendition.id)
+
+    def _settle_rendition_if_running(self, rendition_id: str) -> None:
+        try:
+            current = self.repository.get_rendition(rendition_id)
+            if current.status == "running":
+                self.repository.fail_rendition(
+                    rendition_id,
+                    "RENDER_FAILED",
+                    "The rendition failed before completion.",
+                )
+        except Exception:
+            # Never mask the original failure; the record stays inspectable.
+            return
 
     def get_rendition(self, rendition_id: str) -> dict[str, Any]:
         return self._rendition_view(self.repository.get_rendition(rendition_id))
@@ -275,8 +298,9 @@ class MediaProvenanceApplication:
         )
 
     def verify_rendition(self, rendition_id: str) -> dict[str, Any]:
-        with execution_window():
-            return self._verify_rendition(rendition_id)
+        # Verification replays a pure plan over recorded bytes, so it shares no
+        # gate with renditions or with other checks and may run concurrently.
+        return self._verify_rendition(rendition_id)
 
     def _verify_rendition(self, rendition_id: str) -> dict[str, Any]:
         rendition = self.repository.get_rendition(rendition_id)
@@ -284,6 +308,40 @@ class MediaProvenanceApplication:
             raise RenditionNotCompleted(rendition_id, rendition.status)
 
         audit = self._begin_integrity_audit(rendition_id)
+        try:
+            return self._execute_integrity_audit(rendition, audit)
+        except ApplicationError:
+            raise
+        except Exception:
+            # An accepted check must end in an explainable terminal state
+            # instead of staying pending forever.
+            self._finish_mismatch(audit, "verification_failed")
+        finally:
+            self._settle_audit_if_pending(audit)
+
+    def _settle_audit_if_pending(self, audit: IntegrityAudit) -> None:
+        try:
+            current = self.repository.get_integrity_audit(audit.id)
+            if current.status == "pending":
+                self.repository.settle_integrity_audit(
+                    audit.id,
+                    status="mismatch",
+                    expected_digest=None,
+                    reproduced_digest=None,
+                    expected_descriptor=None,
+                    reproduced_descriptor=None,
+                    reason="verification_failed",
+                )
+        except Exception:
+            # Never mask the original failure; the record stays inspectable.
+            return
+
+    def _execute_integrity_audit(
+        self,
+        rendition: Rendition,
+        audit: IntegrityAudit,
+    ) -> dict[str, Any]:
+        rendition_id = rendition.id
         try:
             edge = self.repository.get_edge(rendition_id)
             output_asset = self.repository.get_asset(rendition.output_asset_id)

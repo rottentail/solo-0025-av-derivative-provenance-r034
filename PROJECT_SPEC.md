@@ -249,12 +249,26 @@ leaking local paths.
 ## Persistence and concurrency rules
 
 - The state file is replaced atomically with `os.replace`.
-- All repository mutations share a process-local re-entrant lock.
+- State mutations are serialized by a process-local re-entrant lock. Only the
+  short read-modify-write of JSON state is serialized; media computation is not.
 - Blob writes use a temporary sibling and atomic replacement.
 - Content-addressed writes are idempotent.
 - Blob paths are generated internally and cannot contain traversal segments.
-- The HTTP server uses a threading server, while repository mutations remain
-  serialized at the state boundary.
+- Blob access uses a per-content-key reader/writer lease. Readers share a key;
+  a write or removal excludes readers of that key. A request never holds two
+  key leases at once, so two mixes that use the same pair of sources in swapped
+  primary/secondary roles cannot deadlock.
+- Media rendering and reproduction are pure functions of already-read bytes and
+  run outside every shared lock. A long rendition therefore does not block a
+  short rendition, another asset, or an integrity check.
+- An accepted rendition always reaches `completed` or `failed` and an accepted
+  integrity check always reaches `verified` or `mismatch`. Terminal settlement
+  is guaranteed even when unexpected exceptions escape media work, so a failed
+  request cannot exhaust the capacity of later requests.
+- Content-addressed blobs are shared by digest and are only removed when no
+  asset references them. A failed persistence step therefore cannot delete
+  bytes that another request already delivered.
+- The HTTP server uses a threading server.
 
 ## Validation plan
 

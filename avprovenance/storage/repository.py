@@ -140,6 +140,13 @@ class ProvenanceRepository:
             "edge": edge.to_dict(),
         }
 
+    def content_key_is_referenced(self, content_key: str) -> bool:
+        state = self.state_file.read()
+        for raw in state["assets"].values():
+            if isinstance(raw, dict) and raw.get("content_key") == content_key:
+                return True
+        return False
+
     def insert_integrity_audit(self, audit: IntegrityAudit) -> IntegrityAudit:
         def mutate(state: dict[str, Any]) -> IntegrityAudit:
             audits = state["integrity_checks"]

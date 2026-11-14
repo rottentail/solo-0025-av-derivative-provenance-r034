@@ -3,29 +3,9 @@
 from __future__ import annotations
 
 from typing import Any
-from typing import Iterator
-import threading
-from contextlib import contextmanager
 
 from ..errors import RenderFailed, UnsupportedMedia
 from ..media import MediaOperationFailure, RenderOutcome, apply_media_operations
-
-
-_execution_condition = threading.Condition()
-_execution_active = False
-
-
-@contextmanager
-def execution_window() -> Iterator[None]:
-    global _execution_active
-    with _execution_condition:
-        while _execution_active:
-            _execution_condition.wait()
-        _execution_active = True
-    yield
-    with _execution_condition:
-        _execution_active = False
-        _execution_condition.notify_all()
 
 
 def execute_plan(
@@ -33,15 +13,15 @@ def execute_plan(
     operations: list[dict[str, Any]],
     secondary_bytes: bytes | None,
 ) -> RenderOutcome:
-    with execution_window():
-        return _execute_media(primary_bytes, operations, secondary_bytes)
+    """Apply one plan to immutable source bytes.
 
+    Rendering is a pure function of the supplied bytes and the plan. It owns no
+    shared mutable state, so independent renditions and integrity checks are
+    free to compute concurrently. Serializing this work would let one long
+    derivative starve every other request, and a single failure must never
+    close the gate for later work.
+    """
 
-def _execute_media(
-    primary_bytes: bytes,
-    operations: list[dict[str, Any]],
-    secondary_bytes: bytes | None,
-) -> RenderOutcome:
     try:
         return apply_media_operations(primary_bytes, operations, secondary_bytes)
     except MediaOperationFailure as exc:
